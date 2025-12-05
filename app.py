@@ -214,42 +214,117 @@ def handle_knowledge():
         return jsonify({"error": "Invalid request body. For adding knowledge, provide 'campaign_summary' or 'content_text'."}), 400
 
 @app.route('/api/knowledge', methods=['GET'])
-def get_all_knowledge():
+def search_or_list_knowledge():
     """
-    ChromaDB에 저장된 모든 지식을 페이지네이션으로 조회합니다.
+    URL 쿼리 파라미터를 사용하여 ChromaDB의 지식을 검색하거나 조회합니다.
+    - 'q': 의미 검색(semantic search)
+    - '[key]__contains=[value]': 메타데이터 'key'에 'value'가 포함된 문서 검색
+    - '[key]=[value]': 메타데이터 'key'가 'value'와 정확히 일치하는 문서 검색
+
     Query Parameters:
-        - page (int): 조회할 페이지 번호 (기본값: 1)
-        - size (int): 한 페이지에 포함할 문서 수 (기본값: 10)
+        - q (str, optional): 의미 검색을 위한 쿼리 텍스트.
+        - n_results (int, optional): 'q' 사용 시 반환할 최대 결과 수 (기본값: 5).
+        - page (int, optional): 'q'가 없을 때 조회할 페이지 번호 (기본값: 1).
+        - size (int, optional): 'q'가 없을 때 한 페이지에 포함할 문서 수 (기본값: 10).
     """
     try:
-        # 쿼리 파라미터에서 page와 size를 가져옵니다.
-        page = request.args.get('page', 1, type=int)
-        size = request.args.get('size', 10, type=int)
+        args = request.args
+        search_query = args.get('q')
 
-        # 페이지 번호가 1보다 작을 경우 1로 보정합니다.
-        if page < 1:
-            page = 1
+        # 1. 필터 조건 분리: exact_match vs contains
+        reserved_keys = ['q', 'n_results', 'page', 'size']
+        exact_filter_conditions = []
+        contains_filters = {}
+        
+        for key, value in args.items():
+            if not key or not value:
+                continue
 
-        all_documents = get_all_documents_from_chroma()
-        total_documents = len(all_documents)
-        total_pages = math.ceil(total_documents / size) if size > 0 else 0
+            if key in reserved_keys:
+                continue
+            
+            if key.endswith('__contains'):
+                field_name = key.removesuffix('__contains')
+                contains_filters[field_name] = value
+            else:
+                exact_filter_conditions.append({key: value})
 
-        # 페이지네이션을 위한 슬라이싱
-        start_index = (page - 1) * size
-        end_index = start_index + size
-        paginated_docs = all_documents[start_index:end_index]
+        # 2. ChromaDB용 where_filter 구성 (Exact-match 전용)
+        where_filter = None
+        if len(exact_filter_conditions) == 1:
+            where_filter = exact_filter_conditions[0]
+        elif len(exact_filter_conditions) > 1:
+            where_filter = {"$and": exact_filter_conditions}
 
-        # 최종 응답 구성
-        response = {
-            "total_documents": total_documents,
-            "total_pages": total_pages,
-            "current_page": page,
-            "page_size": size,
-            "data": paginated_docs
-        }
-        return jsonify(response), 200
+        # 3. 'q' 파라미터가 있는 경우: 의미 검색 후 후처리 필터링
+        if search_query:
+            n_results = args.get('n_results', 5, type=int)
+            
+            # 의미 검색 실행 (정확 일치 필터만 적용)
+            # contains 필터를 위해 더 많은 결과를 요청할 수 있습니다. (예: n_results * 5)
+            results = query_chroma(
+                query_texts=[search_query],
+                n_results=n_results * 5, 
+                where_filter=where_filter
+            )
+
+            # 후처리: 'contains' 필터 적용
+            if contains_filters:
+                final_results = []
+                for doc in results:
+                    all_match = True
+                    for key, value in contains_filters.items():
+                        if value.lower() not in doc.get('metadata', {}).get(key, '').lower():
+                            all_match = False
+                            break
+                    if all_match:
+                        final_results.append(doc)
+                results = final_results[:n_results]
+
+            return jsonify({"results": results}), 200
+
+        # 4. 'q' 파라미터가 없는 경우: 전체 목록 조회 후 후처리 필터링
+        else:
+            # DB에서 정확 일치 필터로 문서 조회
+            all_documents = get_all_documents_from_chroma(where_filter=where_filter)
+            
+            # 후처리: 'contains' 필터 적용
+            if contains_filters:
+                filtered_documents = []
+                for doc in all_documents:
+                    all_match = True
+                    for key, value in contains_filters.items():
+                         if value.lower() not in doc.get('metadata', {}).get(key, '').lower():
+                            all_match = False
+                            break
+                    if all_match:
+                        filtered_documents.append(doc)
+                all_documents = filtered_documents
+
+            # 페이지네이션 적용
+            page = args.get('page', 1, type=int)
+            size = args.get('size', 10, type=int)
+            if page < 1: page = 1
+            
+            total_documents = len(all_documents)
+            total_pages = math.ceil(total_documents / size) if size > 0 else 0
+
+            start_index = (page - 1) * size
+            end_index = start_index + size
+            paginated_docs = all_documents[start_index:end_index]
+
+            response = {
+                "total_documents": total_documents,
+                "total_pages": total_pages,
+                "current_page": page,
+                "page_size": size,
+                "filters": {"exact": where_filter, "contains": contains_filters},
+                "data": paginated_docs
+            }
+            return jsonify(response), 200
+
     except Exception as e:
-        print(f"Error retrieving all documents from Chroma DB with pagination: {e}")
+        print(f"Error in GET /api/knowledge: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/knowledge/<string:doc_id>', methods=['GET'])

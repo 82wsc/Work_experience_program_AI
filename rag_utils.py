@@ -83,13 +83,15 @@ def query_chroma(query_texts: List[str], n_results: int = 5, where_filter: Dict[
     print(f"Queried Chroma DB for '{query_texts[0]}' with filter {where_filter}. Found {len(formatted_results)} results.")
     return formatted_results
 
-def get_all_documents_from_chroma() -> List[Dict[str, Any]]:
+def get_all_documents_from_chroma(where_filter: Dict[str, Any] = None) -> List[Dict[str, Any]]:
     """
     Chroma DB 컬렉션에서 모든 문서를 가져옵니다.
+    :param where_filter: 메타데이터 필터링 조건 (선택 사항)
     """
     # collection = get_or_create_collection() # 이미 모듈 레벨에서 초기화되었으므로 필요 없음
     # get() 메서드를 사용하여 모든 항목을 가져옵니다.
-    results = collection.get(include=['documents', 'metadatas'])
+    # where 필터를 추가하여 필터링된 결과를 가져올 수 있도록 합니다.
+    results = collection.get(where=where_filter, include=['documents', 'metadatas'])
     
     # 결과를 가공합니다.
     formatted_results = []
@@ -101,7 +103,7 @@ def get_all_documents_from_chroma() -> List[Dict[str, Any]]:
                 "metadata": results['metadatas'][i]
             })
     
-    print(f"Retrieved all {len(formatted_results)} documents from Chroma DB.")
+    print(f"Retrieved {len(formatted_results)} documents from Chroma DB with filter {where_filter}.")
     return formatted_results
 
 def get_document_by_id(doc_id: str) -> Dict[str, Any] | None:
