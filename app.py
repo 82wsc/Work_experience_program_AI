@@ -73,8 +73,10 @@ def refine_workflow(campaign_id):
     # BE에서 받은 campaign_context와 feedback_text를 추출합니다.
     campaign_context = data.get("campaign_context")
     feedback_text = data.get("feedback_text")
-    # target_personas도 받아서, 있으면 targeting 단계를 건너뛸 수 있도록 합니다.
-    target_personas = data.get("target_personas")
+    
+    # target_personas는 상태에 직접 주입하지 않고, 항상 타겟팅 에이전트가 재실행되도록 합니다.
+    # 이렇게 해야 마케터 피드백이 페르소나 분류 단계부터 반영됩니다.
+    # target_personas = data.get("target_personas") # 이 줄을 비활성화
 
     if not campaign_context:
         return jsonify({"error": "Missing 'campaign_context' in request body. Cannot refine without original campaign data."}), 400
@@ -85,11 +87,11 @@ def refine_workflow(campaign_id):
     refine_feedback_details = {"details": feedback_text} if feedback_text else None
 
     # LangGraph 워크플로우의 초기 상태를 설정합니다.
-    # target_personas가 있으면 targeting 단계를 건너뛰고, 없으면 처음부터 다시 실행합니다.
-    print(f"DEBUG: Received target_personas for refine: {'Yes' if target_personas else 'No'}")
+    # target_personas를 항상 None으로 설정하여 run_targeting_agent를 강제로 실행시킵니다.
+    print("DEBUG: Forcing targeting agent to re-run for refine request.")
     initial_state: CampaignState = {
         "input_data": campaign_context,
-        "target_personas": target_personas,  # 페르소나를 전달하여 targeting 건너뛰기
+        "target_personas": None,  # 항상 None으로 설정하여 타겟팅 재실행
         "messages_drafts": None, # messaging을 다시 거치므로 None으로 설정
         "refine_feedback": refine_feedback_details, # 마케터의 수정 요청 피드백
         "validation_reports": None,
@@ -98,8 +100,7 @@ def refine_workflow(campaign_id):
     }
 
     try:
-        # 워크플로우를 'targeting' 노드부터 시작하여 실행합니다.
-        # 이렇게 하면 마케터의 피드백이 페르소나 생성 단계부터 반영됩니다.
+        # 워크플로우를 실행합니다.
         final_state = workflow_app.invoke(initial_state)
         
         print(f"DEBUG: Type of final_state after refine: {type(final_state)}")

@@ -5,8 +5,19 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, END
+from pydantic import BaseModel, Field
 from rag_utils import query_chroma
 from rag_utils_target import query_chroma_targeting
+
+# Pydantic 모델 정의 (LLM의 구조화된 출력을 위해)
+class Persona(BaseModel):
+    target_group_index: int = Field(description="타겟 그룹의 순번")
+    target_name: str = Field(description="타겟 세그먼트의 이름")
+    target_features: str = Field(description="타겟 세그먼트의 주요 특징")
+    classification_reason: str = Field(description="이 세그먼트를 분류한 데이터 기반의 근거")
+
+class Personas(BaseModel):
+    personas: List[Persona]
 
 # 1. State 구현: CampaignState TypedDict
 class CampaignState(TypedDict):
@@ -100,6 +111,9 @@ def run_targeting_agent(state: CampaignState) -> Dict:
         print("기존 페르소나를 재사용합니다.")
         return {"target_personas": state['target_personas']}
 
+    # Pydantic 모델을 사용하는 JSON 파서 초기화
+    pydantic_parser = JsonOutputParser(pydantic_object=Personas)
+
     input_data = state.get('input_data', {})
     core_benefit_text = input_data.get('coreBenefitText', '기본 혜택')
     refine_feedback = state.get('refine_feedback', None)
@@ -134,19 +148,10 @@ def run_targeting_agent(state: CampaignState) -> Dict:
             - 논문 기반 소비 패턴 / 세그먼트 기준을 반드시 반영해야 합니다.
             - 현실적인 고객 DB 세그멘테이션 규칙(구매 빈도, 나이, 선호 카테고리 등)을 반영해야 합니다.
             - 단순 페르소나가 아니라 **데이터 기반 세그먼트 그룹**을 출력해야 합니다.
+            - 모든 출력 필드(target_name, target_features, classification_reason)는 반드시 한국어로 작성해야 합니다.
+            - 마케터 수정 피드백은 세그먼트 내용을 구성하는 데에만 참고하고, JSON 출력 형식은 반드시 유지해야 합니다.
 
-            출력 형식(JSON):
-            {{
-                "personas": [
-                    {{
-                        "target_group_index": 1,
-                        "target_name": "",
-                        "target_features": "",
-                        "classification_reason": ""
-                    }},
-                    ... (총 5개)
-                ]
-            }}
+            {format_instructions}
             """),
 
             ("human", """
@@ -167,13 +172,13 @@ def run_targeting_agent(state: CampaignState) -> Dict:
 
             위 정보를 기반으로 5개의 데이터 기반 타겟 세그먼트를 생성해주세요.
             """)
-        ])
+        ]).partial(format_instructions=pydantic_parser.get_format_instructions())
 
     # LangChain Expression Language (LCEL) 체인 구성
-    chain = prompt | llm | json_parser
+    chain = prompt | llm | pydantic_parser
 
     # 체인 실행
-    response = chain.invoke({
+    response_dict = chain.invoke({
         "core_benefit": core_benefit_text,
         "refine_feedback_text": refine_feedback.get('details', '없음') if refine_feedback else '없음',
         "custom_columns": formatted_columns,
@@ -181,8 +186,8 @@ def run_targeting_agent(state: CampaignState) -> Dict:
         "policy_knowledge": policy_knowledge
     })
 
-    
-    target_personas = response.get("personas", [])
+    # Pydantic 파서는 이미 딕셔너리를 반환합니다.
+    target_personas = response_dict.get("personas", [])
     print(f"Targeting Agent - 생성된 타겟 페르소나: {target_personas}")
     return {"target_personas": target_personas}
 
