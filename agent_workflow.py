@@ -638,8 +638,8 @@ def decide_next_step(state: CampaignState) -> str:
     rework_count = state.get('rework_count', 0)
     validation_reports = state.get('validation_reports', [])
 
-    # 최대 재시도 횟수 (2회) 초과 시 강제 종료
-    if rework_count >= 2:
+    # 최대 재시도 횟수 (1회) 초과 시 강제 종료
+    if rework_count >= 1:
         print(f"재시도 횟수 {rework_count}회 초과. Formatter로 이동하여 강제 종료.")
         return "formatter"
 
