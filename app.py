@@ -420,6 +420,69 @@ def get_knowledge_count():
         print(f"Error counting documents in ChromaDB: {e}")
         return jsonify({"error": "Failed to count documents"}), 500
 
+import requests
+from interactive_builder import create_new_session_data, process_message_with_llm
+
+# --- 대화형 캠페인 빌더 세션 저장소 ---
+conversation_sessions: Dict[str, Dict] = {}
+
+
+@app.route('/api/build-campaign/interactive', methods=['POST'])
+def build_campaign_interactive():
+    """
+    대화형으로 캠페인 데이터를 빌드합니다.
+    'conversation_id'를 통해 대화 상태를 유지합니다.
+    """
+    data = request.get_json()
+    if not data or "user_message" not in data:
+        return jsonify({"error": "Invalid JSON input. 'user_message' is required."}), 400
+
+    conversation_id = data.get("conversation_id")
+    user_message = data["user_message"]
+
+    # --- 세션 관리 ---
+    if not conversation_id or conversation_id not in conversation_sessions:
+        # 새로운 대화 시작
+        session_data = create_new_session_data()
+        conversation_id = session_data["conversation_id"]
+        conversation_sessions[conversation_id] = session_data
+        print(f"DEBUG: New conversation started. ID: {conversation_id}")
+    else:
+        # 기존 대화 계속
+        session_data = conversation_sessions[conversation_id]
+        print(f"DEBUG: Continuing conversation. ID: {conversation_id}")
+
+    try:
+        # --- 메시지 처리 (LLM 사용) ---
+        ai_response, is_finished = process_message_with_llm(session_data, user_message)
+
+        # --- 대화 종료 처리 ---
+        if is_finished:
+            # 메모리에서 세션 데이터 삭제
+            if conversation_id in conversation_sessions:
+                del conversation_sessions[conversation_id]
+            print(f"DEBUG: Conversation finished and session deleted. ID: {conversation_id}")
+
+        # --- 응답 반환 ---
+        response_data = {
+            "conversation_id": conversation_id,
+            "ai_response": ai_response,
+            "is_finished": is_finished,
+            "current_campaign_data": session_data["campaign_data"],
+            "conversation_history": session_data["conversation_history"]
+        }
+        
+        return jsonify(response_data), 200
+
+    except Exception as e:
+        # LLM 호출 또는 기타 처리 중 발생할 수 있는 예외 처리
+        print(f"Error during interactive build: {e}")
+        # 예외 발생 시 현재 세션을 삭제하여 다음 요청 시 새로 시작하도록 할 수 있습니다.
+        if conversation_id and conversation_id in conversation_sessions:
+            del conversation_sessions[conversation_id]
+        return jsonify({"error": "An error occurred while processing your request. Please start a new conversation."}), 500
+
+
 @app.route('/')
 def health_check():
     return "AI Agent Flask Server is running!", 200
