@@ -16,6 +16,9 @@ class Persona(BaseModel):
     target_features: str = Field(description="타겟 세그먼트의 주요 특징")
     classification_reason: str = Field(description="이 세그먼트를 분류한 데이터 기반의 근거")
 
+class CampaignTitleResult(BaseModel):
+    campaignTitle: str
+
 class Personas(BaseModel):
     personas: List[Persona]
 
@@ -190,6 +193,56 @@ def run_targeting_agent(state: CampaignState) -> Dict:
     print(f"Targeting Agent - 생성된 타겟 페르소나: {target_personas}")
     return {"target_personas": target_personas}
 
+def summarize_target_features(target_features: str) -> str:
+    prompt = f"""
+아래 타겟 특징을 바탕으로,
+마케팅 메시지에 자연스럽게 들어갈 수 있는
+짧은 대상 규정 표현을 작성하세요.
+
+규칙:
+- 반드시 한 문장
+- 문장은 반드시 '사람이라면' 으로 끝나야 한다
+- '당신이라면', '고객이라면', '분이라면', 너라면 등의 단어 사용 금지
+- 조건 나열 금지 (AND 구조 금지)
+- 구체적 서비스명, 수치, 브랜드명 금지
+- 데이터/분류/전문 용어 금지
+- 20자 내외로 간결하게
+
+타겟 특징:
+{target_features}
+"""
+    result = llm.invoke(prompt)
+    return result.content.strip()
+
+
+
+def generate_campaign_title(core_benefit_text: str) -> str:
+    prompt = f"""
+    아래 핵심 혜택 설명을 읽고,
+    소비자에게 보여줄 수 있는 '프로모션 이름' 하나를 생성하세요.
+
+    규칙:
+    - 반드시 명사형
+    - 하나의 이벤트명처럼 간결
+    - "~을 안내하는", "~를 위한", "프로모션" 금지
+    - 혜택의 성격이 드러나야 함
+    - 15자 내외 권장
+
+    혜택 설명:
+    {core_benefit_text}
+
+    JSON 형식:
+    {{
+      "campaignTitle": "생성된 제목"
+    }}
+    """
+
+    parser = JsonOutputParser()
+    chain = llm | parser
+    result = chain.invoke(prompt)
+    return result["campaignTitle"]
+
+
 def run_messaging_agent(state: CampaignState) -> Dict:
     print("--- Messaging Agent 실행 중 ---")
 
@@ -200,6 +253,10 @@ def run_messaging_agent(state: CampaignState) -> Dict:
     refine_feedback = state.get("refine_feedback")
 
     core_benefit_text = input_data.get("coreBenefitText", "기본 혜택")
+    campaign_title = input_data.get("campaignTitle")
+
+    if not campaign_title:
+        campaign_title = generate_campaign_title(core_benefit_text)
 
     # custom columns
     custom_columns_data = input_data.get("customColumns", {})
@@ -212,186 +269,291 @@ def run_messaging_agent(state: CampaignState) -> Dict:
     source_urls = input_data.get("sourceUrls", [])
     source_urls_str = ", ".join(source_urls) if source_urls else "없음"
 
+    
+    # ----------------------------
+    # 이름 컬럼 존재 여부 판단 (customColumns 기준)
+    # ----------------------------
+    custom_columns_data = input_data.get("customColumns", {})
+
+    name_column_exists = False
+
+    if isinstance(custom_columns_data, dict):
+        for col_name in custom_columns_data.keys():
+            normalized = col_name.lower().replace(" ", "")
+            if (
+                "이름" in col_name
+                or "고객명" in col_name
+                or "name" in normalized
+            ):
+                name_column_exists = True
+                break
+
     # 공통 prompt
     prompt = ChatPromptTemplate.from_messages([
-        ("system", """
-당신은 고객 데이터를 기반으로 브랜드 톤에 맞는 마케팅 메시지를 설계하는 전문 카피라이터입니다.
-아래의 3단계 프로세스를 엄격히 따라,
-P-Type(Professional, 차분하고 신뢰감 있는 톤) 메시지 1개와
-H-Type(Human, 친근하고 대화형 톤) 메시지 1개를 생성해야 합니다.
+    ("system", """
+name_column_exists: {name_column_exists}
+
+당신은 고객 데이터와 프로모션 정보를 바탕으로
+서로 다른 톤의 마케팅 메시지 2개를 생성하는 전문 카피라이터입니다.
+
+반드시 아래 규칙을 100% 준수하십시오.
 
 ---
 
-**[1단계: 분석 및 전략 수립]**
+## 이름 치환 규칙 (중요)
 
-먼저, 주어진 모든 정보(페르소나, 핵심 혜택, RAG 지식)를 종합적으로 분석하고,  
-각 초안에 대한 생성 전략을 머릿속으로 구체적으로 수립합니다.
+- name_column_exists가 true인 경우에만 아래 치환 규칙을 적용한다.
+- name_column_exists가 false인 경우에는 기존 표현을 그대로 사용한다.
 
-아래 <생각 예시>는 당신의 사고 과정을 돕기 위한 참고 자료일 뿐,  
-**이 내용을 그대로 모방하거나 실제 생성 메시지에 사용해서는 안 됩니다.**
+[치환 규칙 – name_column_exists = true]
+- "고객님, 당신" → "[이름]님"
+- "너" → "[이름]"
 
-<생각 예시>
+[기본 규칙 – name_column_exists = false]
+- "고객님", "너" 표현을 그대로 유지한다.
 
-페르소나 분석: 타겟은 ‘합리적 판단을 중시하지만, 일상적 소통 방식에도 민감한 30대 직장인’.
-업무 중 정보를 빠르게 파악하길 원하고, 부담스럽지 않은 대화체 톤을 선호함.
-
-RAG 지식 분석: 과거 성공 사례에서 이 그룹은
-
-명확한 절차·조건 안내(P-Type 특징)에 높은 신뢰를 보였고
-
-일상 언어 기반의 가벼운 공감 표현(H-Type 특징)에 긍정 반응을 보임.
-반면, 과장 문구나 지나친 감성 표현은 신뢰도를 떨어뜨린 사례로 나타남.
-
-초안 1 (P-Type) 전략:
-
-공식 안내 톤 유지
-
-조건·기준·이용 절차 중 핵심 1개를 명확히 제시
-
-감정 표현·과장 금지, 안정적인 문장 구조 사용
-
-초안 2 (H-Type) 전략:
-
-고객의 상황을 가볍게 짚는 공감 문장으로 시작
-
-자연스러운 대화체 흐름 유지
-
-부담 없는 표현으로 혜택의 의미를 전달하되, 과도한 감성은 배제
-
-</생각 예시>
+추가 규칙:
+- "[이름]"은 실제 이름이 아닌 표시용 토큰이다.
+- "[이름]" 외의 이름 표현은 절대 생성하지 않는다.
+- 한 문장에 "[이름]" 토큰은 최대 1회만 사용한다.
 
 ---
 
-**[2단계: 메시지 초안 작성]**
-
-위에서 수립한 전략에 따라 아래 규칙을 준수하여 메시지 초안 2개를 작성합니다.
+## 공통 입력 변수
+- {coreBenefitText}
+- {target_name}
+- {target_features}
+- {source_urls}
+- {feedback_instructions}
+- {target_features_summary}
+- {campaignTitle}
+---
+        
+## 출력 결과물
+- 메시지 초안은 정확히 2개
+- JSON 형식으로만 출력
+- 각 message_text는 반드시 하나의 완성된 메시지 문단
 
 ---
 
-### 핵심 혜택 반영 필수
-본문에는 **{coreBenefitText}** 안의 모든 내용을  
-단 하나도 생략·삭제·변경 없이 자연스럽게 포함해야 합니다.
+## 초안 1: 세련·우아 스타일 가이드 메시지 (고정 무드)
+
+⚠️ 중요  
+초안 1은 **어떤 프로모션이든 아래 구조와 세련된 분위기를 반드시 유지**해야 한다.  
+다만, **문장 표현은 허용된 변주 규칙 범위 내에서만 유연하게 변경 가능**하다.  
+문단 순서, 전체 흐름, 감정선, 말투는 절대 변경하지 않는다.
+
+### 초안 1 작성 규칙
+
+1. 광고 문구처럼 보이는 표현 금지
+2. “최대”, “파격”, “놓치지 마세요” 등 직접적인 행동 유도 표현 지양
+3. 혜택은 나열보다 **문장 중심의 서술**
+4. 감성 키워드 사용 허용  
+   (무드, 안목, 선택, 분위기, 일상, 취향, 품격 등)
+
+
+⚠️ 줄바꿈 및 레이아웃 규칙 (필수)
+
+- 각 문단은 반드시 줄바꿈(개행)으로 분리하여 출력한다.
+- 인사 문단, 출시 안내 문단, 혜택 소개 문단, 혜택 블록, 공감 문단, 마무리 문단은
+  각각 하나의 독립된 문단이어야 한다.
+- 서로 다른 문단을 한 줄로 합치거나 이어서 출력하는 행위는 금지한다.
+- 혜택 블록의 각 혜택 줄은 반드시 줄바꿈으로 구분되어야 한다.
+- 개행이 없는 출력은 구조 위반으로 간주한다.
 
 ---
 
-### 메시지 구성 순서
-1) **오프닝**  
-2) **본문**  
-3) **프로모션 기간**  
-4) **CTA**
+### 문체 변주 규칙 (중요)
+
+아래 항목에 한해 **의미와 감정선은 유지하되, 문장 표현의 다양화를 허용**한다.
+
+- 인사 문장: 정중하고 부드러운 표현 범위 내에서 자연스럽게 변주 가능
+- 도입부 문장: “소식을 전합니다”, “안내드립니다” 등의 표현은 의미를 유지한 채 변형 가능
+- 혜택 소개 연결 문장: 의미는 유지하되 문장 표현은 자유롭게 조정 가능
+- 마무리 문장: 여운과 정중함을 유지하는 범위 내에서 표현 변주 가능
+- 동일한 문장이 반복되지 않도록 자연스럽게 표현을 변경할 것
+
+단, 아래는 절대 변경하지 않는다.
+- 전체 문단 순서
+- 차분하고 세련된 문체
+- 과장되지 않은 우아한 톤
 
 ---
 
-### 초안별 규칙
+### 초안 1 고정 템플릿 (구조 고정 / 문장 표현 유연)
 
-[초안 1: Professional 메시지]
+[정중한 인사 및 메시지 도입 문장 – 세련되고 차분한 어조로 시작]
 
-목적: 차분하고 신뢰감 있는 브랜드 톤으로 공식적인 메시지를 전달하는 것
+[평온한 분위기와 연결된 안내 문장 – 일상 속 작은 여유와 만족을 암시]
 
-규칙
+이번 "{campaignTitle}"은  
+당신의 일상에 조금 더 여유롭고 만족스러운 선택지를 더하기 위해 마련되었습니다.  
+필요할 때, 충분하게. 만족스러운 선택을 중요하게 생각하는 분들을 위한 구성입니다.
 
-첫 문장은 확실한 정보 또는 안내 문장으로 시작
+이번 기회를 통해 만나보실 수 있는 주요 혜택은 다음과 같습니다.
 
-과장 표현·감성 표현 금지
+[혜택_블록_시작]
 
-톤은 정중·단정·중립적
+아래 {coreBenefitText}에는 번호, 불릿(-), 하위 항목으로 구성된 혜택 정보가 포함되어 있다.
 
-조건·절차·기준 등 근거 기반 표현 1회 이상 포함
+[혜택 분해 규칙]
+- {coreBenefitText}에 등장하는 모든 혜택 정보는 분해 대상이다.
+- 상위 불릿이 하위 항목 목록을 소개하는 설명 역할일 경우,
+  해당 상위 불릿은 독립 혜택으로 출력하지 않는다.
+- 하위 항목들은 반드시 하나의 혜택 문장으로 통합하여 출력한다.
+- 동일한 의미의 혜택이 두 줄 이상 출력되면 실패로 간주한다.
+- 어떤 혜택도 생략해서는 안 된다.
 
-문장은 길지 않게, 명료하게 핵심만 정리
+[출력 규칙]
+- 각 혜택은 반드시 한 줄로 출력한다.
+- 각 줄은 반드시 이모티콘 1개로 시작해야 한다.
+- 이모티콘 앞에는 어떤 문자도 오면 안 된다.
+- 각 줄은 하나의 독립된 혜택이며 한 문장만 허용한다.
+- 줄글, 문단 묶기, 혜택 병합은 중대한 규칙 위반이다.
 
-고객 명칭은 ‘고객님’ 또는 중립적 지칭만 사용
+[출력 형식 예시]
+🎬 혜택 설명 한 문장
+🛍️ 혜택 설명 한 문장
+📱 혜택 설명 한 문장
 
----
+이제 위 규칙에 따라  
+{coreBenefitText}에 포함된 모든 혜택을 빠짐없이 출력하시오.  
 
-#### [초안 2: Human 메시지]
-목적: 친근하고 사람같은 대화 톤으로 감정적 거리감을 줄이는 것
+[혜택_블록_종료]
 
-규칙
+이러한 혜택은 고객님처럼 {target_features_summary} 충분히 만족하실겁니다.
 
-첫 문장은 고객 상황 공감 또는 일상적 톤으로 시작
+필요한 순간에 부담 없이 선택하실 수 있도록 준비한 이번 프로모션이  
+당신의 일상에 작은 만족으로 남길 바랍니다.
 
-부드러운 표현 2개 이상 사용
-(예: “조금 더 편하게”, “가볍게 알려드려요”, “필요하실까 해서”)
+{coreBenefitText}에서 확인 가능한 기간 내 제공
 
-딱딱한 공식 표현 금지
-
-문장은 대화하듯 자연스럽게
-
-고객을 직접 지칭하는 2인칭 문체(“고객님”, “지금 필요하실 거예요”) 사용 가능
-
----
-
-### 두 초안은 반드시 서로 확실히 달라야 합니다.
-
----
-
-## 메시지는 반드시 아래 형식 그대로 출력해야 합니다.
-섹션 제목은 꼭 포함하고, 줄바꿈도 동일하게 유지합니다.
-
-[오프닝]
-- 오직 “핵심혜택요약”만 사용하여 1문장
-- 고객의 이목을 집중시킬 수 있는 전략을 사용하여 오프닝 문장을 작성하세요  
-- 예: "띵동📦 {{고객이름}} 고객님께 {{핵심혜택요약}}이 도착했습니다!"
-     -> 택배 문자처럼 보이게 하여 고객이 광고 문자가 아닌 자신에게 필요한 문자처럼 느끼게 하기
-
-[본문]
-② **본문 – {coreBenefitText} 기반 전체 재작성**
-- {coreBenefitText}의 모든 혜택/내용을 빠짐없이 반영
-- 항목이 여러 개면 '-' 로 구분하여 가독성 있게 나열
-- 페르소나 특징 기반 설명 1~2문장 포함
-         
-###  타겟 특성 기반 해석 문단(필수)
-
-아래 변수는 모든 초안에서 반드시 활용해야 합니다:
-- **타겟 특징:** {target_features}
-- **타겟 특징:** {target_name}
-
-혜택 나열 이후, 반드시 아래 요건을 충족하는  
-**“타겟 기반 해석 문단(1~3문장)”**을 추가해야 합니다:
-
-1) {target_features}가 가진 행동·선호·패턴을 직접 언급할 것  
-2) 이 타겟이 이번 프로모션에서 **어떤 부분에서 실제 이익을 얻는지** 설명할 것  
-3) 이 프로모션이 {target_name} 세그먼트에 **특히 적합한 이유**를 구체적으로 연결지어 기술할 것  
-4) 단순 반복 금지 — 반드시 “특징 → 혜택 연결 구조”로 작성
-5) {target_name}을 직접 언급하는 것이 아니라 {target_features}의 특징을 이용하기(예: 주말 활동가 -> 주말을 책과 함께 보내시는 고객님)
-
-※ 이 문단이 누락되면 메시지 생성은 실패로 간주합니다.
-         
-
-[프로모션 기간]
-- {coreBenefitText} 안에서 기간을 직접 추출하여 정확히 작성
-
-[CTA]
 👉 자세히 보기: {source_urls}
 
 ---
 
 
-### 초안 작성 규칙 공통
-- 두 초안은 반드시 서로 구별되는 톤과 메시지
-- {feedback_instructions}
+## 초안 2: 고정 캐주얼 프로모션 템플릿 (강제)
+
+⚠️ 중요  
+초안 2는 **어떤 프로모션이든 아래 구조와 캐주얼한 분위기를 반드시 유지**해야 한다.  
+다만, **문장 표현은 허용된 변주 규칙 범위 내에서만 유연하게 변경 가능**하다.  
+문단 순서, 전체 흐름, 감정선은 절대 변경하지 않는다.
+
+### 초안 2 작성 규칙
+
+1. 반드시 인사 + 가벼운 대화체로 시작
+2. 전체 메시지는 친구에게 말하듯 자연스러운 구어체
+3. 느낌표, 이모지, 감탄 표현 사용 허용
+4. 혜택은 리스트 형식으로 나열
+5. 마지막은 행동 유도 + 가벼운 여운 멘트로 종료
+6. 타겟 특성은 **직접 설명하지 말고**, 말투와 상황 예시 속에 자연스럽게 녹일 것
+     
+
+⚠️ 줄바꿈 및 레이아웃 규칙 (필수)
+
+- 각 문단은 반드시 줄바꿈(개행)으로 분리하여 출력한다.
+- 인사 문단, 출시 안내 문단, 혜택 소개 문단, 혜택 블록, 공감 문단, 마무리 문단은
+  각각 하나의 독립된 문단이어야 한다.
+- 서로 다른 문단을 한 줄로 합치거나 이어서 출력하는 행위는 금지한다.
+- 혜택 블록의 각 혜택 줄은 반드시 줄바꿈으로 구분되어야 한다.
+- 개행이 없는 출력은 구조 위반으로 간주한다.
 
 ---
 
-## 최종 출력(JSON)
-그 어떤 설명도 덧붙이지 말고 아래 형식 그대로 출력하세요:
-각 message_text 내부는 반드시 '[오프닝]~[CTA]' 구조를 그대로 포함해야 합니다.
+### 초안 2 고정 템플릿 (구조·톤 고정)
+
+아래 템플릿의 문단 순서와 전체 분위기는 유지하되,  
+문장 표현은 아래 변주 규칙 범위 내에서 유연하게 조정할 수 있습니다.
+
+⚠️ 문체 변주 규칙 (중요)
+
+아래 항목에 한해 표현의 다양화를 허용한다.
+의미와 감정선은 유지하되, 문장 표현은 매번 달라질 수 있다.
+
+- 인사 문장: 친근한 인사와 호기임 유도 표현 2~3개 중 자연스럽게 선택
+- 설렘 표현: "두근두근", "기다리던", "드디어" 중 일부를 생략하거나 교체 가능
+- 혜택 소개 연결 문장: 의미는 유지하되 문장 표현은 자유롭게 변형 가능
+- 행동 유도 문장: 동일한 의미 내에서 다른 구어체 표현 사용 가능
+
+단, 아래는 절대 변경하지 않는다.
+- 전체 문단 순서
+- 캐주얼하고 친근한 말투
+- 친구에게 말하듯 하는 대화체 톤
+     
+---
+
+### 초안 2 고정 템플릿 (구조 고정 / 문장 표현 유연)
+
+[인사 및 호기심 유도 문장 – 활기찬 인사와 설레는 호기심 유도]
+
+[설렘을 담은 출시 안내 문장 – "{campaignTitle}" 출시 소식을 친근하고 활기차게 전달]
+
+이번 프로모션, 그냥 지나치기엔 너무 아깝거든!  
+어떤 혜택이 있는지 가볍게 정리해 줄게 👀
+
+[혜택_블록_시작]
+
+아래 {coreBenefitText}에는  
+번호, 불릿(-), 하위 항목으로 구성된 혜택 정보가 포함되어 있습니다.
+
+[혜택 분해 및 통합 규칙]
+- {coreBenefitText}에 포함된 모든 혜택 정보는 반드시 분해 대상입니다.
+- 상위 항목이 하위 목록을 소개하는 설명 역할만 할 경우,
+  해당 상위 항목은 단독 혜택으로 출력하지 않습니다.
+- 하위 항목들은 의미를 통합하여 하나의 혜택 문장으로 작성합니다.
+- 동일하거나 유사한 의미의 혜택이 중복 출력되면 실패로 간주합니다.
+- 어떤 혜택도 누락해서는 안 됩니다.
+
+[혜택 출력 규칙]
+- 각 혜택은 반드시 한 줄로 출력합니다.
+- 각 줄은 반드시 이모티콘 1개로 시작합니다.
+- 이모티콘 앞에는 어떠한 문자도 허용되지 않습니다.
+- 각 혜택 출력시 존댓말을 사용하지 않고 친근하면서도 가벼운 말투를 사용합니다.
+- 줄글, 문단 병합, 혜택 묶기는 허용되지 않습니다.
+
+[출력 예시 형식]
+🎬 혜택 설명 한 문장
+🛍️ 혜택 설명 한 문장
+📱 혜택 설명 한 문장
+
+위 규칙에 따라  
+{coreBenefitText}에 포함된 모든 혜택을 빠짐없이 출력하십시오.
+
+[혜택_블록_종료]
+         
+이런 혜택은 너처럼 {target_features_summary} 절대 그냥 지나칠 수 없을걸?
+
+괜히 “좀 더 일찍 볼 걸” 싶어질 수도 있으니까  
+시간 있을 때 한 번만 슬쩍 확인해 봐 😉
+
+{coreBenefitText}에서 확인 가능한 기간 내 제공
+
+👉 자세히 보기: {source_urls}
+
+---
+
+## 최종 출력 형식 (엄수)
 
 {{
-    "drafts": [
-        {{
-            "message_draft_index": 1,
-            "message_text": "(정보성 중심 메시지를 [오프닝]~[CTA] 형식 그대로 작성)"
-        }},
-        {{
-            "message_draft_index": 2,
-            "message_text": "(신뢰성 중심 메시지를 [오프닝]~[CTA] 형식 그대로 작성)"
-        }}
-    ]
+  "drafts": [
+    {{
+      "message_draft_index": 1,
+      "message_text": "초안 1 메시지 전문"
+    }},
+    {{
+      "message_draft_index": 2,
+      "message_text": "초안 2 고정 캐주얼 템플릿 적용 메시지 전문"
+    }}
+  ]
 }}
-""")
-])
+
+---
+
+이 규칙을 어기면 출력은 실패로 간주됩니다.""")
+]).partial(
+    name_column_exists="true" if name_column_exists else "false"
+)
 
     chain = prompt | llm | json_parser
 
@@ -406,13 +568,17 @@ RAG 지식 분석: 과거 성공 사례에서 이 그룹은
         feedback_section = refine_feedback.get("details", "")
 
         for persona in target_personas:
+            persona_features = persona["target_features"]
+            persona_features_summary = summarize_target_features(persona_features)
             response = chain.invoke({
+                "campaignTitle": campaign_title,
                 "coreBenefitText": core_benefit_text,
                 "source_urls": source_urls_str,
                 "feedback_instructions": feedback_instructions,
                 "feedback_section": feedback_section,
                 "target_name": persona["target_name"],
                 "target_features": persona["target_features"],
+                "target_features_summary": persona_features_summary,
                 "columns": columns_for_prompt,
             })
 
@@ -446,6 +612,8 @@ RAG 지식 분석: 과거 성공 사례에서 이 그룹은
 
             messages_drafts = []
             for persona in target_personas:
+                persona_features = persona["target_features"]
+                persona_features_summary = summarize_target_features(persona_features)
                 group_idx = persona["target_group_index"]
 
                 if group_idx in personas_to_rework:
@@ -453,12 +621,14 @@ RAG 지식 분석: 과거 성공 사례에서 이 그룹은
                     feedback_instr = "검증 실패 항목을 기준으로 메시지를 재작성하세요."
 
                     response = chain.invoke({
+                        "campaignTitle": campaign_title,
                         "coreBenefitText": core_benefit_text,
                         "source_urls": source_urls_str,
                         "feedback_instructions": feedback_instr,
                         "feedback_section": all_feedback,
                         "target_name": persona["target_name"],
                         "target_features": persona["target_features"],
+                        "target_features_summary": persona_features_summary,
                         "columns": columns_for_prompt,
                     })
 
@@ -485,13 +655,17 @@ RAG 지식 분석: 과거 성공 사례에서 이 그룹은
 
     messages_drafts = []
     for persona in target_personas:
+        persona_features = persona["target_features"]
+        persona_features_summary = summarize_target_features(persona_features)       
         response = chain.invoke({
+            "campaignTitle": campaign_title,
             "coreBenefitText": core_benefit_text,
             "source_urls": source_urls_str,
             "feedback_instructions": "",
             "feedback_section": "",
             "target_name": persona["target_name"],
             "target_features": persona["target_features"],
+            "target_features_summary": persona_features_summary,
             "columns": columns_for_prompt,
         })
 
